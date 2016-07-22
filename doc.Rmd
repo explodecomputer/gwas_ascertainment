@@ -1,0 +1,152 @@
+---
+title: Influence of UL BiLEVE participants on UK Biobank GWAS
+author: Gibran Hemani
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r, echo=FALSE}
+library(knitr)
+opts_chunk$set(warning=FALSE, message=FALSE, echo=FALSE, cache=TRUE)
+```
+
+
+## Problem:
+
+> Ascertainment on smoking will induce spurious association between genetic variants that affect smoking and any traits that "cause" smoking, and traits that are genetically or environmentally related to smoking. The extent of bias induced will depend on the phenotypic correlation between smoking and the variable analysed. For variables that do not show strong correlations with smoking, then this bias will be small. - Dave Evans
+
+The model is:
+
+```
+snp -> smoking <- trait
+g -> collider_trait <- other_trait
+```
+
+
+```{r, echo=FALSE}
+suppressPackageStartupMessages(library(plyr))
+
+simulation <- function(n, maf, prop_ascertained, cor_gx, cor_xy, sim=1)
+{
+	other_trait <- rnorm(n)
+	g <- rbinom(n, 2, maf)
+	collider_trait <- scale(g) * sqrt(cor_gx) + scale(other_trait) * sqrt(cor_xy) + rnorm(n, sd = sqrt(1-cor_gx-cor_xy))
+
+	cor(collider_trait, other_trait)^2
+	cor(collider_trait, g)^2
+
+	ascertained_index <- which(collider_trait > quantile(collider_trait, 1-prop_ascertained))
+	random_index <- sample(c(1:n)[-ascertained_index], 100000, replace=FALSE)
+	interim_index <- c(ascertained_index, random_index)
+
+	dat <- data.frame(
+		collider_trait=collider_trait, 
+		g=g, 
+		other_trait=other_trait, 
+		ascertained_index=c(1:n) %in% ascertained_index,
+		random_index=c(1:n) %in% random_index,
+		interim_index=c(1:n) %in% interim_index
+	)
+
+	stopifnot(!any(dat$ascertained_index & dat$random_index))
+
+	interim_dat <- subset(dat, interim_index)
+	ascertained_dat <- subset(dat, ascertained_index)
+	random_dat <- subset(dat, random_index)
+
+	m <- list()
+	m[[1]] <- summary(lm(collider_trait ~ g, interim_dat))
+	m[[2]] <- summary(lm(collider_trait ~ g, ascertained_dat))
+	m[[3]] <- summary(lm(collider_trait ~ g, random_dat))
+	m[[4]] <- summary(lm(collider_trait ~ g, dat))
+
+	m[[5]] <- summary(lm(other_trait ~ g, interim_dat))
+	m[[6]] <- summary(lm(other_trait ~ g, ascertained_dat))
+	m[[7]] <- summary(lm(other_trait ~ g, random_dat))
+	m[[8]] <- summary(lm(other_trait ~ g, dat))
+
+	out <- ldply(m, function(x)
+	{
+		d <- coefficients(x)
+		n <- sum(x$df[1:2])
+		b <- d[2,1]
+		se <- d[2,2]
+		t <- d[2,3]
+		p <- d[2,4]
+		return(data.frame(n=n, b=b, se=se,t=t,p=p))
+	})
+	d <- expand.grid(sample=c("interim", "ascertained", "random", "all"), trait=c("collider", "other"), sim=sim, cor_collider_other=cor_xy, cor_collider_snp=cor_gx, maf=maf, prop_ascertained=prop_ascertained)
+	d <- cbind(d, out)
+	return(d)
+}
+
+```
+
+
+```{r echo=FALSE}
+
+
+total_sample_size <- 500000
+proportion_ascertained <- 0.1
+maf <- 0.5
+
+sim_parameters <- expand.grid(
+	sim = 1:10,
+	cor_collider_other=c(0,0.01, 0.1, 0.2),
+	cor_collider_snp=c(0.001, 0.01)
+)
+
+l <- list()
+for(i in 1:nrow(sim_parameters))
+{
+	message(i)
+	l[[i]] <- simulation(total_sample_size, maf, proportion_ascertained, sim_parameters$cor_collider_snp[i], sim_parameters$cor_collider_other[i], i)
+}
+res <- rbind.fill(l)
+
+pres <- ddply(res, .(cor_collider_other, cor_collider_snp, sample, trait), summarize, pval=mean(p), lpval=-log10(pval))
+
+pres$lpval[is.infinite(pres$lpval)] <- 200
+
+```
+
+The total sample size is 500000. The proportion that are UL BiLEVE is 0.1 (around 50000). The interim sample size is 150000 - so 100000 are sampled randomly from the remaining 'non-UL BiLEVE' samples. Simulate the following parameters:
+
+```{r echo=FALSE}
+library(knitr)
+kable(subset(sim_parameters, sim==1))
+```
+
+To ascertain samples for UL BiLEVE, take the individuals with the top 10% of values in the collider trait. **This may be too extreme.**
+
+Perform 10 simulations for each row. The results are shown below:
+
+```{r echo=FALSE}
+
+library(ggplot2)
+
+ggplot(pres, aes(x=cor_collider_other, y=lpval)) +
+geom_point(aes(colour=cor_collider_snp)) +
+geom_line(aes(group=cor_collider_snp, colour=cor_collider_snp)) +
+facet_grid(trait ~ sample, scale="free_y") +
+labs(x="Cor(collider, trait)", y="Mean -log10 p", colour="Cor(collider, SNP)") +
+theme(axis.text.x=element_text(angle=90))
+
+```
+
+In this graph:
+
+```
+all = all 500000 samples in biobank
+interim = 150000 interim samples including UL BiLEVE
+ascertained = only the UL BiLEVE samples
+random = only the non-UL BiLEVE samples
+```
+
+These are the average p-values between the SNP and the collider trait (e.g. smoking, top row) and the SNP and the other trait (e.g. correlated with smoking, bottom row).
+
+## Conclusions:
+
+- There is no inflation in the for the entire biobank sample.
+- The interim sample will have inflation
+- Excluding the ascertained sample will still have inflation, but not as much
